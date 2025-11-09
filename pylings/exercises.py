@@ -13,7 +13,7 @@ import subprocess
 
 import pylings
 from pylings.config import ConfigManager
-from pylings.constants import (BACKUP_DIR, EXERCISES_DIR,FINISHED, SOLUTIONS_DIR)
+from pylings.constants import (BACKUP_DIR, EXERCISES_DIR, FINISHED, SOLUTIONS_DIR, TESTS_DIR)
 
 log = logging.getLogger(__name__)
 
@@ -67,29 +67,38 @@ class ExerciseManager:
             exercise_paths (list[Path]): Paths to all exercises.
 
         Returns:
-            list[tuple[Path, subprocess.CompletedProcess]]: Paths and their results.
+            list[tuple[Path, subprocess.CompletedProcess]]: Paths and their results in original order.
         """
-        results = [None] * len(exercise_paths)
+        result_map = {}
         with ThreadPoolExecutor() as executor:
-            future_to_index = {executor.submit(self.run_exercise, ex): i for i, ex in enumerate(exercise_paths)}
-            for future in as_completed(future_to_index):
-                index = future_to_index[future]
+            future_to_path = {executor.submit(self.run_exercise, ex): ex for ex in exercise_paths}
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
                 try:
                     result = future.result()
-                    results[index] = (exercise_paths[index], result)
+                    result_map[path] = result
                 except Exception as e:
-                    log.error(f"Error processing exercise {exercise_paths[index]}: {e}")
-        return results
+                    log.error("Error processing exercise %s: %s", path, e)
+        
+        return [(path, result_map[path]) for path in exercise_paths if path in result_map]
 
     def _store_result(self, path, result):
-        """Stores the result of an exercise run in the internal tracking dictionary."""
+        """Stores the result of an exercise run in the internal tracking dictionary.
+        
+        Status determination:
+        - returncode == 0: Exercise passed all tests → DONE
+        - returncode != 0: Exercise failed or skipped → PENDING
+        """
         name = path.name
         status = "DONE" if result.returncode == 0 else "PENDING"
+        
+        error_output = result.stderr if result.stderr else result.stdout
+        
         self.exercises[name] = {
             "path": path,
             "status": status,
             "output": self._format_output(result.stdout) if result.returncode == 0 else "",
-            "error": self._format_output(result.stderr) if result.returncode != 0 else None,
+            "error": self._format_output(error_output) if result.returncode != 0 else None,
             "hint": self.config_manager.get_hint(path),
         }
 
@@ -104,12 +113,160 @@ class ExerciseManager:
             str: new status values.
         """
         new_status = "DONE" if result.returncode == 0 else "PENDING"
+        
+        error_output = result.stderr if result.stderr else result.stdout
+        
         self.exercises[name].update({
             "status": new_status,
             "output": self._format_output(result.stdout) if result.returncode == 0 else "",
-            "error": self._format_output(result.stderr) if result.returncode != 0 else None
+            "error": self._format_output(error_output) if result.returncode != 0 else None
         })
         return new_status
+
+    def _get_test_path(self, exercise_path: Path) -> Path | None:
+        """Get the corresponding test file path for an exercise.
+        
+        Args:
+            exercise_path (Path): Path to the exercise file.
+            
+        Returns:
+            Path | None: Path to the test file if it exists, None otherwise.
+            
+        Note:
+            Returns None for backward compatibility with exercises that haven't
+            been migrated to the new test system yet.
+        """
+        path_parts = list(exercise_path.parts)
+        if "exercises" in path_parts:
+            exercises_idx = path_parts.index("exercises")
+            relative_parts = path_parts[exercises_idx + 1:]
+        else:
+            relative_parts = [exercise_path.name]
+        
+        if len(relative_parts) >= 2:
+            topic = relative_parts[0]
+            exercise_name = relative_parts[-1]
+            test_name = f"test_{exercise_name}"
+            test_path = TESTS_DIR / topic / test_name
+            
+            if test_path.exists():
+                log.debug("Found test file: %s", test_path)
+                return test_path
+            
+            log.debug("Test file not found (using direct execution): %s", test_path)
+            return None
+        
+        log.debug("Cannot determine test path for: %s", exercise_path)
+        return None
+
+    def _run_with_tests(self, exercise_path: Path, test_path: Path, cwd: Path) -> subprocess.CompletedProcess:
+        """Run exercise and validate with tests.
+        
+        Args:
+            exercise_path: Path to the exercise file.
+            test_path: Path to the test file.
+            cwd: Working directory for execution.
+            
+        Returns:
+            CompletedProcess with exercise output and test validation result.
+        """
+        log.debug("Running exercise with tests: %s", exercise_path)
+        log.debug("Test path: %s", test_path)
+        log.debug("Working directory: %s", cwd)
+        try:
+            test_result = subprocess.run(
+                [sys.executable, "-m", "pytest", str(test_path), 
+                 "-v", "--tb=line", "--no-header"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                cwd=cwd
+            )
+            tests_pass = test_result.returncode == 0
+            log.debug("Pytest return code: %d", test_result.returncode)
+            log.debug("Pytest stdout: %s", test_result.stdout[:500])
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess(
+                args=[str(exercise_path)],
+                returncode=1,
+                stdout="",
+                stderr="Exercise timed out."
+            )
+        except Exception as e:
+            return subprocess.CompletedProcess(
+                args=[str(exercise_path)],
+                returncode=1,
+                stdout="",
+                stderr=f"Error running tests: {e}"
+            )
+        
+        direct_result = self._run_exercise_directly(exercise_path)
+        
+        if tests_pass and direct_result.returncode == 0:
+            return subprocess.CompletedProcess(
+                args=[str(exercise_path)],
+                returncode=0,
+                stdout=direct_result.stdout,
+                stderr=""
+            )
+        
+        if direct_result.returncode != 0:
+            return direct_result
+        
+        error_msg = self._extract_test_error(test_result.stdout)
+        return subprocess.CompletedProcess(
+            args=[str(exercise_path)],
+            returncode=1,
+            stdout="",
+            stderr=error_msg
+        )
+    
+    def _extract_test_error(self, pytest_output: str) -> str:
+        """Extract error message from pytest output.
+        
+        Parses pytest's short test summary to extract test names and error descriptions.
+        Handles both test failures (FAILED) and errors (ERROR, e.g., syntax errors).
+        
+        Args:
+            pytest_output: Raw pytest -q output.
+            
+        Returns:
+            Formatted error message with test name and description.
+        """
+        lines = pytest_output.split('\n')
+        errors = []
+        
+        for line in lines:
+            if line.startswith(('FAILED ', 'ERROR ')):
+                parts = line.split(' - ', 1)
+                if len(parts) == 2:
+                    prefix = 'FAILED ' if line.startswith('FAILED ') else 'ERROR '
+                    test_path = parts[0].replace(prefix, '').strip()
+                    error_desc = parts[1].strip()
+                    
+                    if '::' in test_path:
+                        test_name = test_path.split('::')[-1]
+                        errors.append(f"{test_name}: {error_desc}")
+                    else:
+                        errors.append(error_desc)
+            
+            elif line.strip().startswith('E ') and 'AssertionError:' in line:
+                error_detail = line.split('AssertionError:', 1)[1].strip()
+                if error_detail and not any(error_detail in e for e in errors):
+                    errors.append(f"  {error_detail}")
+            
+            elif 'File "' in line and 'exercises/' in line and ', line ' in line:
+                try:
+                    start = line.index('exercises/')
+                    end = line.index(', line ')
+                    file_part = line[start:end]
+                    line_part = line[end + 7:].split()[0].strip(',')
+                    if line_part.isdigit():
+                        errors.append(f"  at {file_part}:{line_part}")
+                except (ValueError, IndexError):
+                    pass
+        
+        return '\n'.join(errors) if errors else "Tests failed. Check your code matches the requirements."
 
     def run_exercise(self, path: Path, source: str = "workspace"):
         """Runs a Python exercise file and returns the result.
@@ -121,31 +278,45 @@ class ExerciseManager:
         Returns:
             subprocess.CompletedProcess: Contains returncode, stdout, stderr.
         """
-        log.debug(f"ExerciseManager.run_exercise: path={path}, source={source}")
+        log.debug("ExerciseManager.run_exercise: path=%s, source=%s", path, source)
 
-        # Normalize path
         path_parts = list(path.parts)
         if path_parts[0] == "exercises":
             path_parts = path_parts[1:]
         relative_path = Path(*path_parts)
 
-        if source == "package":
-            resolved_path = Path(pylings.__file__).parent / "exercises" / relative_path
-        else:
-            resolved_path = Path("exercises") / relative_path
-
-        log.debug(f"Resolved path for execution: {resolved_path}")
-
+        base_dir = Path(pylings.__file__).parent if source == "package" else Path.cwd()
+        exercise_path = base_dir / "exercises" / relative_path
+        test_path = self._get_test_path(exercise_path)
+        
+        # BACKWARD COMPATIBILITY: If no test file exists, run exercise directly (old behavior)
+        if test_path is None:
+            log.info("No test file found, falling back to direct execution: %s", exercise_path.name)
+            return self._run_exercise_directly(exercise_path)
+        
+        # NEW SYSTEM: Run exercise directly first to get output, then validate with pytest
+        return self._run_with_tests(exercise_path, test_path, base_dir)
+    
+    def _run_exercise_directly(self, exercise_path: Path) -> subprocess.CompletedProcess:
+        """Run an exercise file directly (backward compatibility for exercises without tests).
+        
+        Args:
+            exercise_path: Path to the exercise file.
+            
+        Returns:
+            CompletedProcess with execution results.
+        """
         try:
             process = subprocess.Popen(
-                [sys.executable, str(resolved_path)],
+                [sys.executable, str(exercise_path)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                cwd=exercise_path.parent
             )
             stdout, stderr = process.communicate(timeout=10)
             return subprocess.CompletedProcess(
-                args=[resolved_path],
+                args=[str(exercise_path)],
                 returncode=process.returncode,
                 stdout=stdout,
                 stderr=stderr
@@ -154,14 +325,14 @@ class ExerciseManager:
             process.kill()
             stdout, stderr = process.communicate()
             return subprocess.CompletedProcess(
-                args=[resolved_path],
+                args=[str(exercise_path)],
                 returncode=1,
                 stdout=stdout,
                 stderr="Exercise timed out."
             )
         except Exception as e:
             return subprocess.CompletedProcess(
-                args=[resolved_path],
+                args=[str(exercise_path)],
                 returncode=1,
                 stdout="",
                 stderr=str(e)
@@ -186,13 +357,7 @@ class ExerciseManager:
         new_status = self._update_exercise_status(name, result)
         self.current_exercise_state = new_status
 
-        #if prev_status != "DONE" and new_status == "DONE":
-        #    self.completed_count += 1
-        #elif prev_status == "DONE" and new_status != "DONE":
-        #    self.completed_count -= 1
         self.completed_count = sum(1 for ex in self.exercises.values() if ex["status"] == "DONE")
-
-        #self.completed_count = max(0, min(self.completed_count, len(self.exercises)))
         log.debug(f"ExerciseManager.update_exercise_output.self.completed_count: ${self.completed_count}")
         if self.completed_count == len(self.exercises) and not self.completed_flag:
             print(FINISHED)
@@ -302,30 +467,51 @@ class ExerciseManager:
         Raises:
             FileNotFoundError: If the resolved file doesn't exist.
         """
-        log.debug(f"ExerciseManager.get_exercise_path: path={path}, source={source}")
-        try:            
-            path_parts = list(path.parts)
-            if path_parts[0] == "exercises":
-                rel_parts = path_parts[path_parts.index('exercises') + 1:]
+        log.debug("ExerciseManager.get_exercise_path: path=%s, source=%s", path, source)
+        try:
+            # Convert to absolute path first
+            abs_path = path.resolve() if not path.is_absolute() else path
+            
+            # Handle special case of "." (current directory)
+            if str(path) == ".":
+                log.error("Cannot use '.' as exercise path. Please specify a valid exercise file.")
+                raise ValueError("Cannot use '.' as exercise path. Please specify a valid exercise file.")
+            
+            path_parts = list(abs_path.parts)
+            
+            # Handle empty path
+            if not path_parts:
+                log.error("Empty path provided")
+                raise ValueError("Empty path provided")
+            
+            # Extract relative path from exercises directory
+            if "exercises" in path_parts:
+                exercises_idx = path_parts.index("exercises")
+                rel_parts = path_parts[exercises_idx + 1:]
             else:
-                rel_parts = path_parts
+                # Assume it's already a relative path
+                rel_parts = list(path.parts)
+            
+            if not rel_parts:
+                log.error("Cannot determine exercise path from: %s", path)
+                raise ValueError(f"Cannot determine exercise path from: {path}")
 
             rel_path = Path(*rel_parts)
 
             if source == "workspace":
                 root = Path.cwd() / "exercises" / rel_path
-                log.debug(f"ExerciseManager.get_exercise_path: root={root}")
+                log.debug("ExerciseManager.get_exercise_path: root=%s", root)
             else:
                 root = Path(pylings.__file__).parent / "exercises" / rel_path
-                log.debug(f"ExerciseManager.get_exercise_path: root={root}")
+                log.debug("ExerciseManager.get_exercise_path: root=%s", root)
+            
             if not root.exists():
-                log.error(f"ExerciseManager.get_exercise_path.fileNotFound: {path}")
-                exit(1)
-                #raise FileNotFoundError(f"Exercise not found: {path}")
+                log.error("ExerciseManager.get_exercise_path.fileNotFound: %s", path)
+                raise FileNotFoundError(f"Exercise file not found: {path}")
 
             return root
         except Exception as e:
-            log.error(f"get_exercise_path error: {e}")
+            log.error("get_exercise_path error: %s", e)
             raise
 
 
@@ -345,7 +531,8 @@ class ExerciseManager:
 
         output = result.stdout if result.returncode == 0 else result.stderr
         print(output)
-        exit(0 if result.returncode == 0 else 1)
+        if result.returncode != 0:
+            raise RuntimeError(f"Exercise execution failed with return code {result.returncode}")
 
 
     def print_root_solution(self, path: Path, source: str = "package"):
@@ -391,28 +578,27 @@ class ExerciseManager:
 
         if not path.exists():
             print(f"Exercise path not found: {path}")
-            exit(1)
+            raise FileNotFoundError(f"Exercise path not found: {path}")
 
         if exercises_dir not in path.parents:
             print("Path must be under exercises/")
-            exit(1)
+            raise ValueError("Path must be under exercises/")
 
         try:
             rel_path = path.relative_to(exercises_dir)
             log.debug("ExerciseManager.reset_exercise_by_path.rel_path: %s", rel_path)
-        except ValueError:
+        except ValueError as e:
             print("Path must be under exercises/")
-            exit(1)
+            raise ValueError("Path must be under exercises/") from e
 
         backup_path = BACKUP_DIR / rel_path
         log.debug("ExerciseManager.reset_exercise_by_path.backup_path: %s", backup_path)
         if not backup_path.exists():
             print(f"No backup found for {rel_path}")
-            exit(1)
+            raise FileNotFoundError(f"No backup found for {rel_path}")
 
         copy(backup_path, path)
         print(f"Reset exercise: {rel_path}")
-        exit(0)
 
 
     def toggle_hint(self):
